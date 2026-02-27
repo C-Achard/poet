@@ -16,11 +16,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
-# needed due to empty tensor bug in pytorch and torchvision 0.5
 import torchvision
-if float(torchvision.__version__[:3]) < 0.7:
-    from torchvision.ops import _new_empty_tensor
-    from torchvision.ops.misc import _output_size
 
 
 class SmoothedValue(object):
@@ -47,7 +43,8 @@ class SmoothedValue(object):
         """
         if not is_dist_avail_and_initialized():
             return
-        t = torch.tensor([self.count, self.total], dtype=torch.float64, device='cuda')
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        t = torch.tensor([self.count, self.total], dtype=torch.float64, device=device)
         dist.barrier()
         dist.all_reduce(t)
         t = t.tolist()
@@ -86,44 +83,37 @@ class SmoothedValue(object):
 
 
 def all_gather(data):
-    """
-    Run all_gather on arbitrary picklable data (not necessarily tensors)
-    Args:
-        data: any picklable object
-    Returns:
-        list[data]: list of data gathered from each rank
-    """
     world_size = get_world_size()
     if world_size == 1:
         return [data]
 
-    # serialized to a Tensor
     buffer = pickle.dumps(data)
+
+    # Keep legacy storage approach (still works), just avoid hardcoding cuda
     storage = torch.ByteStorage.from_buffer(buffer)
-    tensor = torch.ByteTensor(storage).to("cuda")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tensor = torch.ByteTensor(storage).to(device)
 
-    # obtain Tensor size of each rank
-    local_size = torch.tensor([tensor.numel()], device="cuda")
-    size_list = [torch.tensor([0], device="cuda") for _ in range(world_size)]
+    local_size = torch.tensor([tensor.numel()], device=device, dtype=torch.long)
+    size_list = [torch.zeros_like(local_size) for _ in range(world_size)]
     dist.all_gather(size_list, local_size)
-    size_list = [int(size.item()) for size in size_list]
-    max_size = max(size_list)
 
-    # receiving Tensor from all ranks
-    # we pad the tensor because torch all_gather does not support
-    # gathering tensors of different shapes
-    tensor_list = []
-    for _ in size_list:
-        tensor_list.append(torch.empty((max_size,), dtype=torch.uint8, device="cuda"))
-    if local_size != max_size:
-        padding = torch.empty(size=(max_size - local_size,), dtype=torch.uint8, device="cuda")
+    size_list = [int(s.item()) for s in size_list]
+    max_size = max(size_list)
+    local_size_int = int(local_size.item())
+
+    tensor_list = [torch.empty((max_size,), dtype=torch.uint8, device=device) for _ in size_list]
+
+    if local_size_int != max_size:
+        padding = torch.empty((max_size - local_size_int,), dtype=torch.uint8, device=device)
         tensor = torch.cat((tensor, padding), dim=0)
+
     dist.all_gather(tensor_list, tensor)
 
     data_list = []
-    for size, tensor in zip(size_list, tensor_list):
-        buffer = tensor.cpu().numpy().tobytes()[:size]
-        data_list.append(pickle.loads(buffer))
+    for size, t in zip(size_list, tensor_list):
+        buf = t.cpu().numpy().tobytes()[:size]
+        data_list.append(pickle.loads(buf))
 
     return data_list
 
@@ -147,7 +137,13 @@ def reduce_dict(input_dict, average=True):
         for k in sorted(input_dict.keys()):
             names.append(k)
             #values.append(input_dict[k])
-            values.append(input_dict[k].cuda())
+            # pick a device from first tensor value, fallback to cpu
+            v = input_dict[k]
+            if isinstance(v, torch.Tensor):
+                device = v.device
+            else:
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            values.append(v.to(device))
         values = torch.stack(values, dim=0)
         dist.all_reduce(values)
         if average:
@@ -307,7 +303,7 @@ class NestedTensor(object):
 def nested_tensor_from_tensor_list(tensor_list: List[Tensor]):
     # TODO make this more general
     if tensor_list[0].ndim == 3:
-        if torchvision._is_tracing():
+        if torch.jit.is_tracing():
             # nested_tensor_from_tensor_list() does not export well to ONNX
             # call _onnx_nested_tensor_from_tensor_list() instead
             return _onnx_nested_tensor_from_tensor_list(tensor_list)
@@ -443,26 +439,10 @@ def accuracy(output, target, topk=(1,)):
 
     res = []
     for k in topk:
-        correct_k = correct[:k].view(-1).float().sum(0)
+        correct_k = correct[:k].reshape(-1).float().sum(0)
         res.append(correct_k.mul_(100.0 / batch_size))
     return res
 
 
 def interpolate(input, size=None, scale_factor=None, mode="nearest", align_corners=None):
-    # type: (Tensor, Optional[List[int]], Optional[float], str, Optional[bool]) -> Tensor
-    """
-    Equivalent to nn.functional.interpolate, but with support for empty batch sizes.
-    This will eventually be supported natively by PyTorch, and this
-    class can go away.
-    """
-    if float(torchvision.__version__[:3]) < 0.7:
-        if input.numel() > 0:
-            return torch.nn.functional.interpolate(
-                input, size, scale_factor, mode, align_corners
-            )
-
-        output_shape = _output_size(2, input, size, scale_factor)
-        output_shape = list(input.shape[:-2]) + list(output_shape)
-        return _new_empty_tensor(input, output_shape)
-    else:
-        return torchvision.ops.misc.interpolate(input, size, scale_factor, mode, align_corners)
+    return torch.nn.functional.interpolate(input, size=size, scale_factor=scale_factor, mode=mode, align_corners=align_corners)

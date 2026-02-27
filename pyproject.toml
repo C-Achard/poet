@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "poet-live"
+version = "0.0.0rc0"
+description = "POET (Pose Estimation Transformer) inference utilities"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [{name = "Lucas Stoffl, Maxime Vidal, Alexander Mathis"}]
+dependencies = [
+  "numpy",
+  "pillow",
+]
+
+[project.optional-dependencies]
+torch = [
+  "torch>=2.0",
+  "torchvision>=0.15",
+]
+viz = [
+  "matplotlib",
+  "opencv-python",
+]
+notebook = [
+  "ipywidgets",
+  "ipython",
+  "jupyter",
+]
+
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["poet_live"]
